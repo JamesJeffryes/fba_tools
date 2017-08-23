@@ -3,7 +3,7 @@ use strict;
 use Bio::KBase::Exceptions;
 # Use Semantic Versioning (2.0.0-rc.1)
 # http://semver.org 
-our $VERSION = '1.5.3';
+our $VERSION = '1.6.5';
 our $GIT_URL = 'ssh://git@github.com/cshenry/fba_tools.git';
 our $GIT_COMMIT_HASH = 'c8042e971c32b9ed927068c086160556d22dd1f5';
 
@@ -57,7 +57,10 @@ sub util_finalize_call {
 }
 
 sub util_store {
-	my ($self) = @_;
+	my ($self,$store) = @_;
+    if (defined($store)) {
+		$self->{_kbase_store} = $store;
+	}
     if (!defined($self->{_kbase_store})) {
     	$self->{_kbase_store} = Bio::KBase::ObjectAPI::KBaseStore->new();
     }
@@ -121,12 +124,13 @@ sub util_get_file_path {
 
 sub util_parse_input_table {
 	my($self,$filename,$columns) = @_;
+	# $columns is a list(string column_name, bool required, ? default_value)
 	if (!-e $filename) {
 		Bio::KBase::utilities::error("Could not find input file:".$filename."!\n");
 	}
 	open(my $fh, "<", $filename) || die "Could not open file ".$filename;
 	my $headingline = <$fh>;
-	$headingline =~ tr/\r\n//d;#This line removes line endings from nix and windows files
+	$headingline =~ tr/\r\n_//d;#This line removes line endings from nix and windows files and underscores
 	my $delim = undef;
 	if ($headingline =~ m/\t/) {
 		$delim = "\\t";
@@ -136,22 +140,28 @@ sub util_parse_input_table {
 	if (!defined($delim)) {
 		Bio::KBase::utilities::error("$filename either does not use commas or tabs as a separator!");
 	}
-	my $headings = [split(/$delim/,$headingline)];
+	# remove capitalization for column matching
+	my $headings = [split(/$delim/,lc($headingline))];
 	my $data = [];
 	while (my $line = <$fh>) {
 		$line =~ tr/\r\n//d;#This line removes line endings from nix and windows files
 		push(@{$data},[split(/$delim/,$line)]);
 	}
 	close($fh);
-	my $headingColums;
+	my $headingColumns;
 	for (my $i=0;$i < @{$headings}; $i++) {
-		$headingColums->{$headings->[$i]} = $i;
+		$headingColumns->{$headings->[$i]} = $i;
 	}
 	my $error = 0;
 	for (my $j=0;$j < @{$columns}; $j++) {
-		if (!defined($headingColums->{$columns->[$j]->[0]}) && defined($columns->[$j]->[1]) && $columns->[$j]->[1] == 1) {
-			$error = 1;
-			print "Model file missing required column '".$columns->[$j]->[0]."'!\n";
+		if (!defined($headingColumns->{$columns->[$j]->[0]})){
+			if (defined($columns->[$j]->[1]) && $columns->[$j]->[1] == 1) {
+				$error = 1;
+				print "ERROR: Model file missing required column '" . $columns->[$j]->[0] . "'!\n";
+			} else {
+				print "WARNING: Import file missing optional column '" .
+					$columns->[$j]->[0] . "' Defaults may be used.\n";
+			}
 		}
 	}
 	if ($error == 1) {
@@ -162,12 +172,15 @@ sub util_parse_input_table {
 		my $object = [];
 		for (my $j=0;$j < @{$columns}; $j++) {
 			$object->[$j] = undef;
+			# if default defined, start with default value
 			if (defined($columns->[$j]->[2])) {
 				$object->[$j] = $columns->[$j]->[2];
 			}
-			if (defined($headingColums->{$columns->[$j]->[0]}) && defined($item->[$headingColums->{$columns->[$j]->[0]}])) {
-				$object->[$j] = $item->[$headingColums->{$columns->[$j]->[0]}];
+			#if value defiend in $item, copy it over
+			if (defined($headingColumns->{$columns->[$j]->[0]}) && defined($item->[$headingColumns->{$columns->[$j]->[0]}])) {
+				$object->[$j] = $item->[$headingColumns->{$columns->[$j]->[0]}];
 			}
+			# ? this may have something to do with lists...
 			if (defined($columns->[$j]->[3])) {
 				if (defined($object->[$j]) && length($object->[$j]) > 0) {
 					my $d = $columns->[$j]->[3];
@@ -175,7 +188,7 @@ sub util_parse_input_table {
 				} else {
 					$object->[$j] = [];
 				}
-			}
+			};
 		}
 		push(@{$objects},$object);
 	}
@@ -550,20 +563,31 @@ sub build_multiple_metabolic_models
     $self->util_initialize_call($params,$ctx);
 	my $orig_genome_workspace = $params->{genome_workspace};
 	my $genomes = $params->{genome_ids};
+	# If user provides a list of genomes in text form, append these to the existing gemome ids
 	my $new_genome_list = [split(/[\n;\|]+/,$params->{genome_text})];
 	for (my $i=0; $i < @{$new_genome_list}; $i++) {
 		push(@{$genomes},$new_genome_list->[$i]);
 	}
+    # look up genome object info so we can get names
+    my $query;
+	for (my $i=0; $i < @{$genomes}; $i++) {
+		push(@{$query}, {ref=>$genomes->[$i]});
+	};
+    my $ws = Bio::KBase::kbaseenv::ws_client();
+    my $infos = $ws->get_object_info3({objects=>$query})->{infos};
 	my $htmlmessage = "<p>";
+    # run build metabolic model
 	for (my $i=0; $i < @{$genomes}; $i++) {
 		$params->{genome_workspace} = $orig_genome_workspace;
 		$params->{genome_id} = $genomes->[$i];
+        # If a full refferece is used, this app can build from multiple workspaces
 		if ($genomes->[$i] =~ m/(\d+)\/(\d+)\/*(\d*)/) {
 			$params->{genome_id} = $2;
 			$params->{genome_workspace} = $1;
 		}
-		$params->{fbamodel_output_id} = $params->{genome_id}.".mdl";
-		print "Now building model of ".$genomes->[$i]."\n";
+        my $genome_name = $infos->[$i]->[1];
+		$params->{fbamodel_output_id} = $genome_name.".mdl";
+		print "Now building model of ".$genome_name."\n";
 		eval {
 			my $output = Bio::KBase::ObjectAPI::functions::func_build_metabolic_model($params);
 		};
@@ -3209,8 +3233,8 @@ sub tsv_file_to_media
     my $mediadata = $self->util_parse_input_table($file_path,[
 		["compounds",1],
 		["concentrations",0,"0.001"],
-		["minFlux",0,"-100"],
-		["maxFlux",0,"100"],
+		["minflux",0,"-100"],
+		["maxflux",0,"100"],
 	]);
 	my $input = {media_id => $p->{media_name},workspace => $p->{workspace_name}};
 	for (my $i=0; $i < @{$mediadata}; $i++) {
@@ -3748,7 +3772,7 @@ sub tsv_file_to_phenotype_set
 		["geneko",0,"",";"],
 		["media",1,""],
 		["mediaws",1,""],
-		["addtlCpd",0,"",";"],
+		["addtlcpd",0,"",";"],
 		["growth",1]
 	]);
 	for (my $i=0; $i < @{$phenodata}; $i++) {
